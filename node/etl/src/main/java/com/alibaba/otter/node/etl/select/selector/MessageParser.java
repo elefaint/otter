@@ -47,6 +47,7 @@ import com.alibaba.otter.shared.common.model.config.channel.ChannelParameter.Syn
 import com.alibaba.otter.shared.common.model.config.data.DataMedia;
 import com.alibaba.otter.shared.common.model.config.data.DataMedia.ModeValue;
 import com.alibaba.otter.shared.common.model.config.data.DataMediaPair;
+import com.alibaba.otter.shared.common.model.config.data.DataMediaSource;
 import com.alibaba.otter.shared.common.model.config.data.db.DbMediaSource;
 import com.alibaba.otter.shared.common.model.config.pipeline.Pipeline;
 import com.alibaba.otter.shared.common.model.config.pipeline.PipelineParameter;
@@ -106,7 +107,10 @@ public class MessageParser {
                         if (isMarkTable) {
                             RowChange rowChange = RowChange.parseFrom(entry.getStoreValue());
                             if (!rowChange.getIsDdl()) {
-                                int loopback = checkLoopback(pipeline, rowChange.getRowDatas(0));
+                                int loopback = 0;
+                                if (rowChange.getRowDatasCount() > 0) {
+                                    loopback = checkLoopback(pipeline, rowChange.getRowDatas(0));
+                                }
                                 if (loopback == 2) {
                                     needLoopback |= true; // 只处理正常同步产生的回环数据
                                 }
@@ -121,7 +125,10 @@ public class MessageParser {
                         if (isCompatibleLoopback) {
                             RowChange rowChange = RowChange.parseFrom(entry.getStoreValue());
                             if (!rowChange.getIsDdl()) {
-                                int loopback = checkCompatibleLoopback(pipeline, rowChange.getRowDatas(0));
+                                int loopback = 0;
+                                if (rowChange.getRowDatasCount() > 0) {
+                                    loopback = checkCompatibleLoopback(pipeline, rowChange.getRowDatas(0));
+                                }
                                 if (loopback == 2) {
                                     needLoopback |= true; // 只处理正常同步产生的回环数据
                                 }
@@ -439,27 +446,32 @@ public class MessageParser {
                 }
                 // 获取一下目标库的拆分字段,设置源表为主键
                 // 首先要求源和目标的库名表名是一致的
-                DbDialect targetDbDialect = dbDialectFactory.getDbDialect(pipeline.getId(),
-                    (DbMediaSource) targetDataMedia.getSource());
-                if (targetDbDialect.isDRDS()) {
-                    String schemaName = buildName(eventData.getSchemaName(),
-                        dataMedia.getNamespaceMode(),
-                        targetDataMedia.getNamespaceMode());
-                    String tableName = buildName(eventData.getSchemaName(),
-                        dataMedia.getNameMode(),
-                        targetDataMedia.getNameMode());
-                    String shardColumns = targetDbDialect.getShardColumns(schemaName, tableName);
-                    if (StringUtils.isNotEmpty(shardColumns)) {
-                        String columns[] = StringUtils.split(shardColumns, ',');
-                        for (String key : columns) {
-                            org.apache.ddlutils.model.Column col = table.findColumn(key, false);
-                            if (col != null) {
-                                col.setPrimaryKey(true);
-                            } else {
-                                logger.warn(String.format("shardColumn %s in table[%s.%s] is not found",
-                                    key,
-                                    eventData.getSchemaName(),
-                                    eventData.getTableName()));
+                DataMediaSource targetSource = targetDataMedia.getSource();
+                if (targetSource instanceof DbMediaSource
+                    && StringUtils.containsIgnoreCase(((DbMediaSource) targetSource).getUrl(), "drds")) {
+                    // 优先判断是否为drds
+                    DbDialect targetDbDialect = dbDialectFactory.getDbDialect(pipeline.getId(),
+                        (DbMediaSource) targetDataMedia.getSource());
+                    if (targetDbDialect.isDRDS()) {
+                        String schemaName = buildName(eventData.getSchemaName(),
+                            dataMedia.getNamespaceMode(),
+                            targetDataMedia.getNamespaceMode());
+                        String tableName = buildName(eventData.getSchemaName(),
+                            dataMedia.getNameMode(),
+                            targetDataMedia.getNameMode());
+                        String shardColumns = targetDbDialect.getShardColumns(schemaName, tableName);
+                        if (StringUtils.isNotEmpty(shardColumns)) {
+                            String columns[] = StringUtils.split(shardColumns, ',');
+                            for (String key : columns) {
+                                org.apache.ddlutils.model.Column col = table.findColumn(key, false);
+                                if (col != null) {
+                                    col.setPrimaryKey(true);
+                                } else {
+                                    logger.warn(String.format("shardColumn %s in table[%s.%s] is not found",
+                                        key,
+                                        eventData.getSchemaName(),
+                                        eventData.getTableName()));
+                                }
                             }
                         }
                     }
@@ -517,20 +529,20 @@ public class MessageParser {
                 }
             }
             for (Column column : afterColumns) {
-                // 在update操作时，oracle和mysql存放变更的非主键值的方式不同,oracle只有变更的字段;
-                // mysql会把变更前和变更后的字段都发出来，只需要取有变更的字段.
-                // 如果是oracle库，after里一定为对应的变更字段
-
-                boolean isUpdate = true;
-                if (entry.getHeader().getSourceType() == CanalEntry.Type.MYSQL) { // mysql的after里部分数据为未变更,oracle里after里为变更字段
-                    isUpdate = column.getUpdated();
-                }
-
                 if (isKey(tableHolder, tableName, column)) {
                     // 获取变更后的主键
-                    keyColumns.put(column.getName(), copyEventColumn(column, isRowMode || isUpdate, tableHolder));
+                    keyColumns.put(column.getName(), copyEventColumn(column, true, tableHolder));
                 } else if (needAllColumns || entry.getHeader().getSourceType() == CanalEntry.Type.ORACLE
                            || column.getUpdated()) {
+                    // 在update操作时，oracle和mysql存放变更的非主键值的方式不同,oracle只有变更的字段;
+                    // mysql会把变更前和变更后的字段都发出来，只需要取有变更的字段.
+                    // 如果是oracle库，after里一定为对应的变更字段
+
+                    boolean isUpdate = true;
+                    if (entry.getHeader().getSourceType() == CanalEntry.Type.MYSQL) { // mysql的after里部分数据为未变更,oracle里after里为变更字段
+                        isUpdate = column.getUpdated();
+                    }
+
                     notKeyColumns.put(column.getName(), copyEventColumn(column, isRowMode || isUpdate, tableHolder));// 如果是rowMode，所有字段都为updated
                 }
             }
